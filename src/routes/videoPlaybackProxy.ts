@@ -106,101 +106,144 @@ videoPlaybackProxy.get("/", async (c) => {
 
     const fetchClient = await getFetchClient(config);
 
-    let headResponse: Response | undefined;
-    let location = `https://${host}/videoplayback?${queryParams.toString()}`;
+    // Everything needed to answer a ranged request is already available from the
+    // request itself: the client's Range header, plus `clen` and `mime` in the URL.
+    // A HEAD request used to supply it, but that forced the response status to be
+    // committed *before* the body had been fetched - so an upstream failure turned
+    // into a well-formed 2xx with a truncated body, which players cannot tell apart
+    // from end of stream and simply stall on.
+    //
+    // Fetch the first chunk first, and only answer once it is in hand.
+    const chunkSize =
+        config.networking.videoplayback.video_fetch_chunk_size_mb *
+        1_000_000;
+
+    const totalBytes = Number(queryParams.get("clen") || "0");
+    const requestStartByte = Number(firstByte || "0");
+
+    let requestEndByte: number | undefined;
+    if (lastByte) {
+        requestEndByte = Number(lastByte);
+    } else if (totalBytes > 0) {
+        requestEndByte = totalBytes - 1;
+    }
+
+    const baseUrl = new URL(
+        `https://${host}/videoplayback?${queryParams.toString()}`,
+    );
 
     // https://datatracker.ietf.org/doc/html/draft-ietf-httpbis-p2-semantics-17#section-7.3
     // A maximum of 5 redirections is defined in the note of the section 7.3
     // of this RFC, that's why `i < 5`
-    for (let i = 0; i < 5; i++) {
-        const googlevideoResponse: Response = await fetchClient(location, {
-            method: "HEAD",
-            headers: headersToSend,
-            redirect: "manual",
-        });
-        if (googlevideoResponse.status == 403) {
-            return new Response(googlevideoResponse.body, {
-                status: googlevideoResponse.status,
-                statusText: googlevideoResponse.statusText,
-            });
-        }
-        if (googlevideoResponse.headers.has("Location")) {
-            location = googlevideoResponse.headers.get("Location") as string;
-            continue;
-        } else {
-            headResponse = googlevideoResponse;
-            break;
-        }
-    }
-    if (headResponse === undefined) {
-        throw new HTTPException(502, {
-            res: new Response(
-                "Google headResponse redirected too many times",
-            ),
-        });
-    }
+    const fetchRange = async (
+        start: number,
+        end: number,
+    ): Promise<Response> => {
+        let url = new URL(baseUrl);
 
-    // =================== REQUEST CHUNKING =======================
-    // if the requested response is larger than the chunkSize, break up the response
-    // into chunks and stream the response back to the client to avoid rate limiting
-    const { readable, writable } = new TransformStream();
-    const stream = new StreamingApi(writable, readable);
-    const googleVideoUrl = new URL(location);
-    const getChunk = async (start: number, end: number) => {
-        googleVideoUrl.searchParams.set(
-            "range",
-            `${start}-${end}`,
-        );
-        const postResponse = await fetchClient(googleVideoUrl, {
-            method: "POST",
-            body: new Uint8Array([0x78, 0]), // protobuf: { 15: 0 } (no idea what it means but this is what YouTube uses),
-            headers: headersToSend,
-        });
-        if (postResponse.status !== 200) {
-            throw new Error("Non-200 response from google servers");
+        for (let i = 0; i < 5; i++) {
+            url.searchParams.set("range", `${start}-${end}`);
+            const res = await fetchClient(url, {
+                method: "POST",
+                body: new Uint8Array([0x78, 0]), // protobuf: { 15: 0 } (no idea what it means but this is what YouTube uses),
+                headers: headersToSend,
+                redirect: "manual",
+            });
+
+            if (res.headers.has("Location")) {
+                url = new URL(res.headers.get("Location") as string, url);
+                try {
+                    await res.body?.cancel();
+                } catch (_) {
+                    // nothing useful to do here
+                }
+                continue;
+            }
+
+            return res;
         }
-        await stream.pipe(postResponse.body);
+
+        throw new Error("googlevideo redirected too many times");
     };
 
-    const chunkSize =
-        config.networking.videoplayback.video_fetch_chunk_size_mb * 1_000_000;
-    const totalBytes = Number(
-        headResponse.headers.get("Content-Length") || "0",
-    );
+    // A failed chunk is usually transient (stale edge, throttling), and retrying
+    // is only safe while nothing has been written to the client.
+    const fetchRangeWithRetry = async (
+        start: number,
+        end: number,
+        attempts = 3,
+    ): Promise<Response> => {
+        let lastStatus = 0;
 
-    // if no range sent, the client wants thw whole file, i.e. for downloads
-    const wholeRequestStartByte = Number(firstByte || "0");
-    const wholeRequestEndByte = wholeRequestStartByte + Number(totalBytes) - 1;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            const res = await fetchRange(start, end);
+            if (res.status === 200) {
+                return res;
+            }
 
-    let chunk = Promise.resolve();
-    for (
-        let startByte = wholeRequestStartByte;
-        startByte < wholeRequestEndByte;
-        startByte += chunkSize
-    ) {
-        // i.e.
-        // 0 - 4_999_999, then
-        // 5_000_000 - 9_999_999, then
-        // 10_000_000 - 14_999_999
-        let endByte = startByte + chunkSize - 1;
-        if (endByte > wholeRequestEndByte) {
-            endByte = wholeRequestEndByte;
+            lastStatus = res.status;
+            try {
+                await res.body?.cancel();
+            } catch (_) {
+                // nothing useful to do here
+            }
+
+            if (attempt < attempts) {
+                await new Promise((resolve) =>
+                    setTimeout(resolve, 200 * attempt)
+                );
+            }
         }
-        chunk = chunk.then(() => getChunk(startByte, endByte));
+
+        throw new Error(
+            `non-200 from googlevideo after ${attempts} attempts (last status ${
+                lastStatus || "n/a"
+            }, range ${start}-${end})`,
+        );
+    };
+
+    const firstEndByte = requestEndByte !== undefined
+        ? Math.min(requestStartByte + chunkSize - 1, requestEndByte)
+        : requestStartByte + chunkSize - 1;
+
+    let firstResponse: Response;
+    try {
+        firstResponse = await fetchRangeWithRetry(
+            requestStartByte,
+            firstEndByte,
+        );
+    } catch (err) {
+        // Nothing has been sent yet, so return a real error status: the player can
+        // then retry the segment or fall back to a different rendition.
+        const detail = err instanceof Error ? err.message : String(err);
+        console.error(
+            `[videoplayback] ${host} range ${requestStartByte}-${firstEndByte} failed: ${detail}`,
+        );
+        return new Response("Upstream fetch failed", { status: 502 });
     }
-    chunk.catch(() => {
-        stream.abort();
-    });
-    // =================== REQUEST CHUNKING =======================
+
+    // Bind once: TypeScript cannot narrow `.body` across the closure below.
+    const firstBody = firstResponse.body;
+    if (!firstBody) {
+        // Same reasoning as above: nothing sent yet, so fail cleanly.
+        console.error(`[videoplayback] ${host} returned no body`);
+        return new Response("Upstream returned no body", { status: 502 });
+    }
 
     const headersForResponse: Record<string, string> = {
-        "content-length": headResponse.headers.get("content-length") || "",
         "access-control-allow-origin": "*",
-        "accept-ranges": headResponse.headers.get("accept-ranges") || "",
-        "content-type": headResponse.headers.get("content-type") || "",
-        "expires": headResponse.headers.get("expires") || "",
-        "last-modified": headResponse.headers.get("last-modified") || "",
+        "accept-ranges": "bytes",
+        "content-type": firstResponse.headers.get("content-type") ||
+            queryParams.get("mime") || "application/octet-stream",
     };
+
+    if (requestEndByte !== undefined) {
+        headersForResponse["content-length"] = String(
+            requestEndByte - requestStartByte + 1,
+        );
+        headersForResponse["content-range"] =
+            `bytes ${requestStartByte}-${requestEndByte}/${totalBytes || "*"}`;
+    }
 
     if (title) {
         headersForResponse["content-disposition"] = `attachment; filename="${
@@ -208,37 +251,48 @@ videoPlaybackProxy.get("/", async (c) => {
         }"; filename*=UTF-8''${encodeRFC5987ValueChars(title)}`;
     }
 
-    let responseStatus = headResponse.status;
-    if (requestBytes && responseStatus == 200) {
-        // check for range headers in the forms:
-        // "bytes=0-" get full length from start
-        // "bytes=500-" get full length from 500 bytes in
-        // "bytes=500-1000" get 500 bytes starting from 500
-        if (lastByte) {
-            responseStatus = 206;
-            headersForResponse["content-range"] = `bytes ${requestBytes}/${
-                queryParams.get("clen") || "*"
-            }`;
-        } else {
-            // i.e. "bytes=0-", "bytes=600-"
-            // full size of content is able to be calculated, so a full Content-Range header can be constructed
-            const bytesReceived = headersForResponse["content-length"];
-            // last byte should always be one less than the length
-            const totalContentLength = Number(firstByte) +
-                Number(bytesReceived);
-            const lastByte = totalContentLength - 1;
-            if (firstByte !== "0") {
-                // only part of the total content returned, 206
-                responseStatus = 206;
-            }
-            headersForResponse["content-range"] =
-                `bytes ${firstByte}-${lastByte}/${totalContentLength}`;
+    // Response headers are committed below, with the first chunk already fetched.
+    // Remaining chunks are streamed in order; if one fails mid-flight the stream is
+    // aborted, which is visible to the client as a truncated response instead of
+    // silence.
+    const { readable, writable } = new TransformStream();
+    const stream = new StreamingApi(writable, readable);
+
+    const pump = async () => {
+        await stream.pipe(firstBody);
+
+        if (requestEndByte === undefined) {
+            return;
         }
-    }
+
+        for (
+            let startByte = requestStartByte + chunkSize;
+            startByte <= requestEndByte;
+            startByte += chunkSize
+        ) {
+            const endByte = Math.min(startByte + chunkSize - 1, requestEndByte);
+            const res = await fetchRangeWithRetry(startByte, endByte);
+            if (!res.body) {
+                throw new Error(`empty body for range ${startByte}-${endByte}`);
+            }
+            await stream.pipe(res.body);
+        }
+    };
+
+    pump().catch((err) => {
+        const detail = err instanceof Error
+            ? `${err.name}: ${err.message}`
+            : String(err);
+        console.error(
+            `[videoplayback] ${host} stream aborted after ${requestStartByte}-${
+                requestEndByte ?? "?"
+            }: ${detail}`,
+        );
+        stream.abort();
+    });
 
     return new Response(stream.responseReadable, {
-        status: responseStatus,
-        statusText: headResponse.statusText,
+        status: requestBytes ? 206 : 200,
         headers: headersForResponse,
     });
 });
