@@ -177,7 +177,12 @@ videoPlaybackProxy.get("/", async (c) => {
 
         for (let attempt = 1; attempt <= attempts; attempt++) {
             const res = await fetchRange(start, end);
-            if (res.status === 200) {
+            // 206 is a perfectly good answer: an edge that honours the range with a
+            // Content-Range header replies 206, and after a redirect the chunk fetch
+            // can end up there too. Upstream used to demand exactly 200 here, which
+            // turned every redirect-followed chunk into "Non-200 response from
+            // google servers" -> stream.abort() -> a silent empty 206 (see #403).
+            if (res.status === 200 || res.status === 206) {
                 return res;
             }
 
@@ -196,9 +201,9 @@ videoPlaybackProxy.get("/", async (c) => {
         }
 
         throw new Error(
-            `non-200 from googlevideo after ${attempts} attempts (last status ${
+            `unusable status from googlevideo after ${attempts} attempts (last ${
                 lastStatus || "n/a"
-            }, range ${start}-${end})`,
+            }), range ${start}-${end}`,
         );
     };
 
