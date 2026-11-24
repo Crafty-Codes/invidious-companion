@@ -16,16 +16,20 @@ export const companionRoutes = (
     app: Hono,
     config: Config,
 ) => {
-    const loggerUnixSocket = (message: string, ...rest: string[]) => {
-        message = message.replace("//localhost/", "/");
+    // Access logging. The default hono formatter prints the full request URL,
+    // and a videoplayback URL carries ~1 KB of query string - twice per request
+    // ("-->" and "<--"). That is over 90% of the log volume for a media proxy,
+    // so the query string is dropped here. Failures are still actionable: see
+    // the `[videoplayback] streaming failed` line, which logs host and range.
+    const accessLogger = (message: string, ...rest: string[]) => {
+        if (config.server.use_unix_socket) {
+            message = message.replace("//localhost/", "/");
+        }
+        message = message.replace(/\?[^\s]*/g, "");
         console.log(message, ...rest);
     };
 
-    if (config.server.use_unix_socket) {
-        app.use("*", logger(loggerUnixSocket));
-    } else {
-        app.use("*", logger());
-    }
+    app.use("*", logger(accessLogger));
 
     app.use(
         "/youtubei/v1/*",
